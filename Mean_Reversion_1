@@ -1,0 +1,121 @@
+import pandas as pd
+import numpy as np
+from scipy import stats
+from quantopian.pipeline import Pipeline
+from quantopian.algorithm import attach_pipeline, pipeline_output
+from quantopian.pipeline.data.builtin import USEquityPricing
+from quantopian.pipeline.factors import AverageDollarVolume
+import statsmodels.tsa.stattools as ts
+
+def initialize(context):
+    # Create, register and name a pipeline in initialize.
+    pipe = Pipeline()
+    attach_pipeline(pipe, 'dollar_volume_10m_pipeline')
+    # Construct a 100-day average dollar volume factor and add it to the pipeline.
+    dollar_volume = AverageDollarVolume(window_length=100)
+    pipe.add(dollar_volume, 'dollar_volume')
+    # Create high dollar-volume filter to be the top 0.2% of stocks by dollar volume.
+    high_dollar_volume = dollar_volume.percentile_between(99.8, 100)
+    # Set the screen on the pipelines to filter out securities.
+    pipe.set_screen(high_dollar_volume)
+    context.stat_filter = {}
+    context.stat_filter['adf_p_value'] = {}
+    context.stat_filter['hurst_exponent'] = {}
+    context.stat_filter['adf_p_value']['use'] = True
+    context.stat_filter['adf_p_value']['lookback'] = 20
+    context.stat_filter['adf_p_value']['function'] = adf_p_value
+    context.stat_filter['adf_p_value']['test_condition_min'] = 0.0
+    context.stat_filter['adf_p_value']['test_condition_max'] = 0.20
+    context.stat_filter['hurst_exponent']['use'] = True
+    context.stat_filter['hurst_exponent']['lookback'] = 40
+    context.stat_filter['hurst_exponent']['function'] = hurst
+    context.stat_filter['hurst_exponent']['test_condition_min'] = 0.0
+    context.stat_filter['hurst_exponent']['test_condition_max'] = 0.4
+    set_asset_restrictions(security_lists.restrict_leveraged_etfs)
+    context.dev_multiplier = 2
+    context.max_notional = 50000
+    context.min_notional = -50000
+    context.minutes_traded = 0
+    total_minutes = 390
+    liquidation_timeframe = 15
+    for minute in range(1, total_minutes - liquidation_timeframe, 10):
+        schedule_function(process_data_and_order, date_rules.every_day(), time_rules.market_open(minutes=minute),half_days=True)
+    schedule_function(func=end_of_day, date_rule=date_rules.every_day(), time_rule=time_rules.market_close(minutes=liquidation_timeframe), half_days=True)
+    
+def before_trading_start(context, data):
+    # Pipeline_output returns the constructed dataframe.
+    output = pipeline_output('dollar_volume_10m_pipeline')
+    # sort the output. Most liquid stocks are at the top of the list, and least liquid stocks are at the bottom
+    sorted_output = output.sort('dollar_volume', ascending = False)
+    context.my_securities = sorted_output.index
+
+def process_data_and_order(context, data):
+    dev_mult = context.dev_multiplier
+    notional = context.portfolio.positions_value
+    # Calls get_linear so that moving_average has something to reference by the time it is called
+    linear = get_linear(context, data)        
+    # Checks every minute
+    try:
+        for stock in context.my_securities:
+            currentprice = data.current(stock, "price")
+            moving_average = linear[stock]
+            stddev_history = data.history(stock, "price", 20, "1d")[:-1]
+            moving_dev = stddev_history.std()
+            upperband1 = moving_average + dev_mult*moving_dev
+            upperband2 = moving_average + 1.5*dev_mult*moving_dev
+            lowerband1 = moving_average - dev_mult*moving_dev
+            lowerband2 = moving_average - 1.5*dev_mult*moving_dev
+            if currentprice > upperband1 and currentprice < upperband2 and notional > context.min_notional and notional < context.max_notional:
+                order_target_percent(stock, -1)
+                log.debug("Shorting 1% of portfolio value with " + str(stock))
+            elif currentprice < lowerband1 and currentprice > lowerband2 and notional > context.min_notional and notional < context.max_notional:
+                order_target_percent(stock, 1)
+                log.debug("Going long 1% of portfolio value with " + str(stock))
+            elif currentprice> upperband2 and notional > context.min_notional and notional < context.max_notional:
+                stock = order_target_percent(stock, 0)
+                log.debug("Liquidating " + str(stock))
+            elif currentprice < lowerband2 and notional > context.min_notional and notional < context.max_notional: 
+                stock = order_target_percent(stock, 0)
+                log.debug("Liquidating " + str(stock))
+            elif currentprice == moving_average:
+                stock = order_target_percent(stock, 0)
+                log.debug("Liquidating " + str(stock))
+    except:
+        return
+
+# Linear regression curve that returns the intercept the curve
+# Uses the past x days
+def get_linear(context, data):
+    days = [i for i in range(1,31)]
+    stocks = {}
+    for stock in context.my_securities:
+        linear = stats.linregress(days, data.history(stock, "price", 30, "1d"))[1]
+        stocks[stock] = linear
+    return stocks
+
+def adf_p_value(input_ts):
+    # returns p-value from Augmented Dickey-Fullet test for cointegration, with lag=1
+    return ts.adfuller(input_ts, 1)[1]
+
+def hurst(input_ts, lags_to_test=20):  
+    # hurst < 0.5 - input_ts is mean reverting
+    # hurst = 0.5 - input_ts is effectively random/geometric brownian motion
+    # hurst > 0.5 - input_ts is trending
+    tau = []
+    lagvec = []  
+    #  Step through the different lags  
+    for lag in range(2, lags_to_test):  
+        #  produce price difference with lag  
+        pp = np.subtract(input_ts[lag:], input_ts[:-lag])  
+        #  Write the different lags into a vector  
+        lagvec.append(lag)  
+        #  Calculate the variance of the differnce vector  
+        tau.append(np.sqrt(np.std(pp)))  
+    #  linear fit to double-log graph (gives power)  
+    m = np.polyfit(np.log10(lagvec), np.log10(tau), 1)  
+    # calculate hurst  
+    hurst = m[0]*2   
+    return hurst 
+def end_of_day(context, data):
+    for stock in context.my_securities:
+        order_target_percent(stock, 0)
